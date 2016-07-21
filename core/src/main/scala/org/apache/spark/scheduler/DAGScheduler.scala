@@ -148,7 +148,7 @@ class DAGScheduler(
    * that require the shuffle stage complete, the mapping will be removed, and the only record of
    * the shuffle data will be in the MapOutputTracker).（当shuffle stage 完成后，map才会被移除，shuffle data被最终保存到MapOutputTracker）
    */
-  private[scheduler] val shuffleIdToMapStage = new HashMap[Int, ShuffleMapStage]//每一个shuffle都有一个id，以及对应map侧的ShuffleMapStage
+  private[scheduler] val shuffleIdToMapStage = new HashMap[Int, ShuffleMapStage]//key为shuffle依赖的id，value为对应map侧的ShuffleMapStage
   private[scheduler] val jobIdToActiveJob = new HashMap[Int, ActiveJob]//保存当前DAGScheduler中ActiveJob的id以及对应的ActiveJob
 
   // Stages we need to run whose parents aren't done（等待父stages完成才能运行的stage）
@@ -289,46 +289,17 @@ class DAGScheduler(
   }
 
   /**
-   * Gets a shuffle map stage if one exists in shuffleIdToMapStage. Otherwise, if the
-   * shuffle map stage doesn't already exist, this method will create the shuffle map stage in
-   * addition to any missing ancestor shuffle map stages.
-    * Option[A] 是一个类型为A的可选值的容器：如果值存在，Option[A]就是一个Some[A]，如果不存在，Option[A]就是对象None
-    * Some 是一个样例类，可以出现在模式匹配表达式或者其他允许模式出现的地方
-   */
-  private def getOrCreateShuffleMapStage(
-      shuffleDep: ShuffleDependency[_, _, _],
-      firstJobId: Int): ShuffleMapStage = {
-    shuffleIdToMapStage.get(shuffleDep.shuffleId) match {
-      case Some(stage) =>
-        stage
-
-      case None =>
-        // Create stages for all missing ancestor shuffle dependencies.
-        getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
-          // Even though getMissingAncestorShuffleDependencies only returns shuffle dependencies
-          // that were not already in shuffleIdToMapStage, it's possible that by the time we
-          // get to a particular dependency in the foreach loop, it's been added to
-          // shuffleIdToMapStage by the stage creation process for an earlier dependency. See
-          // SPARK-13902 for more information.
-          if (!shuffleIdToMapStage.contains(dep.shuffleId)) {
-            createShuffleMapStage(dep, firstJobId)
-          }
-        }
-        // Finally, create a stage for the given shuffle dependency.
-        createShuffleMapStage(shuffleDep, firstJobId)
-    }
-  }
-
-  /**
    * Creates a ShuffleMapStage that generates the given shuffle dependency's partitions. If a
    * previously run stage generated the same shuffle data, this function will copy the output
    * locations that are still available from the previous shuffle to avoid unnecessarily
    * regenerating data.
+    * 根据给出的shuffle依赖创建ShuffleMapStage并且生成这个shuffle依赖的分区，如果一个之前运行的stage已经生成了相同的shuffle
+    * data，这个方法将会拷贝这些仍然在之前shuffle可用的输出的位置来避免不必要的重复生成数据
    */
   def createShuffleMapStage(shuffleDep: ShuffleDependency[_, _, _], jobId: Int): ShuffleMapStage = {
-    val rdd = shuffleDep.rdd
-    val numTasks = rdd.partitions.length
-    val parents = getOrCreateParentStages(rdd, jobId)
+    val rdd = shuffleDep.rdd//获得shuffle依赖左侧的RDD
+    val numTasks = rdd.partitions.length//根据RDD的分区数确定task数，有多少分区就有多少task
+    val parents = getOrCreateParentStages(rdd, jobId)//此处开始递归
     val id = nextStageId.getAndIncrement()
     val stage = new ShuffleMapStage(id, rdd, numTasks, parents, jobId, rdd.creationSite, shuffleDep)
 
@@ -358,6 +329,46 @@ class DAGScheduler(
   }
 
   /**
+    * Gets a shuffle map stage if one exists in shuffleIdToMapStage. Otherwise, if the
+    * shuffle map stage doesn't already exist, this method will create the shuffle map stage in
+    * addition to any missing ancestor shuffle map stages.
+    * Option[A] 是一个类型为A的可选值的容器：如果值存在，Option[A]就是一个Some[A]，如果不存在，Option[A]就是对象None
+    * Some 是一个样例类，可以出现在模式匹配表达式或者其他允许模式出现的地方
+    * 输入的是当前job的RDD的直接宽依赖或者间接宽依赖，以及当前的jobId
+    * 每个shuffle依赖有唯一的shuffleId，
+    */
+  private def getOrCreateShuffleMapStage(
+                                          shuffleDep: ShuffleDependency[_, _, _],
+                                          firstJobId: Int): ShuffleMapStage = {
+    shuffleIdToMapStage.get(shuffleDep.shuffleId) match {//shuffleIdToMapStage为DAGScheduler中的HashMap，key为shuffle依赖的id，value为对应map侧的ShuffleMapStage
+      case Some(stage) =>
+        stage//如果在shuffleIdToMapStage中有这个shuffle依赖的ShuffleMapStage则返回
+
+      case None =>
+        // 如果在shuffleIdToMapStage中不存在则为该分支子图中所有的shuffle依赖创建ShuffleMapStage
+        // Create stages for all missing ancestor shuffle dependencies.
+        // 将当前RDD直接或间接shuffle依赖的RDD传入，第一层shuffle依赖RDD，通过下述方法得到了这个分支所有的shuffle依赖
+        // 遍历这些shuffle依赖，如果没有在shuffleIdToMapStage中注册过的就创建ShuffleMapStage，
+        getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
+          //这部分的主要目的是为了将当前shuffle依赖的左侧RDD所有的祖先的和自己的shuffle依赖找出来，（shuffle依赖）的shuffle依赖
+          //这是个递归的算法，同样，
+          // Even though getMissingAncestorShuffleDependencies only returns shuffle dependencies
+          // that were not already in shuffleIdToMapStage, it's possible that by the time we
+          // get to a particular dependency in the foreach loop, it's been added to
+          // shuffleIdToMapStage by the stage creation process for an earlier dependency. See
+          // SPARK-13902 for more information.
+          if (!shuffleIdToMapStage.contains(dep.shuffleId)) {//对这个分支中每个shuffle依赖都判断是否已经创建ShuffleMapStage并注册过，如果没有则创建
+            createShuffleMapStage(dep, firstJobId)
+            //创建ShuffleMapStage的过程也是一个深度遍历，这个是采用递归方式实现的，最后创建当前（shuffle依赖）的ShuffleMapStage
+            //
+          }
+        }
+        // Finally, create a stage for the given shuffle dependency.
+        createShuffleMapStage(shuffleDep, firstJobId)
+    }
+  }
+
+  /**
    * Create a ResultStage associated with the provided jobId.
     * 创建一个与提交的Job对应的jobId相关联的ResultStage，这个jobId唯一对应本次的job，也对应本次job中提交的唯一的DAG图
    */
@@ -367,7 +378,7 @@ class DAGScheduler(
       partitions: Array[Int],
       jobId: Int,
       callSite: CallSite): ResultStage = {
-    val parents = getOrCreateParentStages(rdd, jobId)
+    val parents = getOrCreateParentStages(rdd, jobId)//这里是递归的开始
     val id = nextStageId.getAndIncrement()
     val stage = new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
     stageIdToStage(id) = stage
@@ -380,35 +391,12 @@ class DAGScheduler(
    * the provided firstJobId.
     * 获得或者创建给定RDD的父stages链表，也就是从当前RDD往前推，划分出一个ResultStage后，再获得之前的父stage
     * 如果是个新的stage，没有父stage，就用参数给定的firstJobId绑定
+    * 取出与当前job的RDD所有的直接shuffle依赖（宽依赖）和间接shuffle依赖（宽依赖）交给getOrCreateShuffleMapStage处理
    */
   private def getOrCreateParentStages(rdd: RDD[_], firstJobId: Int): List[Stage] = {
     getShuffleDependencies(rdd).map { shuffleDep =>
-      getOrCreateShuffleMapStage(shuffleDep, firstJobId)
+      getOrCreateShuffleMapStage(shuffleDep, firstJobId)//为每一个直接或间接shuffle依赖获取或创建ShuffleMapStage，先判断有没有注册过
     }.toList
-  }
-
-  /** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet */
-  private def getMissingAncestorShuffleDependencies(
-      rdd: RDD[_]): Stack[ShuffleDependency[_, _, _]] = {
-    val ancestors = new Stack[ShuffleDependency[_, _, _]]
-    val visited = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new Stack[RDD[_]]
-    waitingForVisit.push(rdd)
-    while (waitingForVisit.nonEmpty) {
-      val toVisit = waitingForVisit.pop()
-      if (!visited(toVisit)) {
-        visited += toVisit
-        getShuffleDependencies(toVisit).foreach { shuffleDep =>
-          if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
-            ancestors.push(shuffleDep)
-            waitingForVisit.push(shuffleDep.rdd)
-          } // Otherwise, the dependency and its ancestors have already been registered.
-        }
-      }
-    }
-    ancestors
   }
 
   /**
@@ -447,6 +435,36 @@ class DAGScheduler(
       }
     }
     parents
+  }
+
+  /** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet
+    * 找到传入RDD所有的shuffle依赖后，判断这些shuffle依赖是否在HashMap类型 shuffleToMapStage（key为shuffleId）中注册过，
+    * 没有注册过的shuffle依赖压入到ShuffleDependency类型的ancestors栈中，再取出所有未注册的shuffle依赖左侧RDD，压入到
+    * 未访问过rdd的栈，取出后再重复上述步骤，整个是一个深度遍历，也可以用递归实现，整个函数执行完成后，将该RDD所有祖先的
+    * 未注册Shuffle依赖（也包括它自己的），shuffle依赖真是藏五可藏啊，只要跟我RDD有路线的（窄依赖也算通路）我都顺着揪出来，
+    * 如果遍历到子节点没有了shuffle依赖返回的ancestors为空
+    * */
+  private def getMissingAncestorShuffleDependencies(
+                                                     rdd: RDD[_]): Stack[ShuffleDependency[_, _, _]] = {
+    val ancestors = new Stack[ShuffleDependency[_, _, _]]
+    val visited = new HashSet[RDD[_]]
+    // We are manually maintaining a stack here to prevent StackOverflowError
+    // caused by recursively visiting
+    val waitingForVisit = new Stack[RDD[_]]
+    waitingForVisit.push(rdd)
+    while (waitingForVisit.nonEmpty) {
+      val toVisit = waitingForVisit.pop()
+      if (!visited(toVisit)) {
+        visited += toVisit
+        getShuffleDependencies(toVisit).foreach { shuffleDep =>
+          if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
+            ancestors.push(shuffleDep)
+            waitingForVisit.push(shuffleDep.rdd)
+          } // Otherwise, the dependency and its ancestors have already been registered.
+        }
+      }
+    }
+    ancestors
   }
 
   private def getMissingParentStages(stage: Stage): List[Stage] = {
